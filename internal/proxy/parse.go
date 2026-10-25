@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 )
@@ -42,6 +43,10 @@ type result struct {
 	hasUsage      bool
 	finish        []string
 	firstToken    time.Time
+	lastToken     time.Time
+	tokenEvents   int
+	gaps          []time.Duration // time between consecutive token-bearing events
+	provider      string          // upstream provider when the gateway reports it (OpenRouter-style "provider")
 	events        int
 
 	output    strings.Builder
@@ -99,10 +104,52 @@ func (r *result) appendText(s string) {
 	r.output.WriteString(s)
 }
 
+const maxGaps = 50_000
+
+// markToken records the arrival of a token-bearing event. Arrival time is when
+// the bytes reached the proxy, so events that arrive in the same read share a
+// timestamp: a run of zero gaps means upstream buffered and then burst.
 func (r *result) markToken(now time.Time) {
 	if r.firstToken.IsZero() {
 		r.firstToken = now
+	} else if len(r.gaps) < maxGaps {
+		r.gaps = append(r.gaps, now.Sub(r.lastToken))
 	}
+	r.lastToken = now
+	r.tokenEvents++
+}
+
+// streamStats summarises how output was delivered.
+type streamStats struct {
+	chunks    int
+	genWindow time.Duration // first token to last token
+	maxGap    time.Duration
+	medianGap time.Duration
+}
+
+func (r *result) stats() streamStats {
+	s := streamStats{chunks: r.tokenEvents}
+	if r.tokenEvents > 0 {
+		s.genWindow = r.lastToken.Sub(r.firstToken)
+	}
+	if len(r.gaps) == 0 {
+		return s
+	}
+	sorted := append([]time.Duration(nil), r.gaps...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	s.maxGap = sorted[len(sorted)-1]
+	s.medianGap = sorted[len(sorted)/2]
+	return s
+}
+
+// buffered reports whether a stream looks like it was produced in full upstream
+// and released in a burst: most of the wall time is spent before the first
+// token, then the remaining chunks arrive back to back.
+func (s streamStats) buffered(ttft, total time.Duration) bool {
+	if s.chunks < 10 || total <= 0 {
+		return false
+	}
+	return s.medianGap < time.Millisecond && float64(ttft)/float64(total) > 0.5
 }
 
 // ---- streaming (SSE) ----
@@ -149,10 +196,11 @@ func (p *sseParser) line(line []byte) {
 
 // streamEvent is a superset of the chunk shapes we care about.
 type streamEvent struct {
-	Type    string `json:"type"`
-	Model   string `json:"model"`
-	Usage   *usage `json:"usage"`
-	Choices []struct {
+	Type     string `json:"type"`
+	Model    string `json:"model"`
+	Provider string `json:"provider"`
+	Usage    *usage `json:"usage"`
+	Choices  []struct {
 		Delta struct {
 			Content          *string         `json:"content"`
 			ReasoningContent *string         `json:"reasoning_content"`
@@ -197,6 +245,9 @@ func (p *sseParser) event(payload []byte) {
 
 	if ev.Model != "" {
 		r.model = ev.Model
+	}
+	if ev.Provider != "" {
+		r.provider = ev.Provider
 	}
 	r.addUsage(ev.Usage)
 
@@ -266,9 +317,10 @@ func (p *sseParser) event(payload []byte) {
 // ---- non-streaming JSON ----
 
 type fullResponse struct {
-	Model   string `json:"model"`
-	Usage   *usage `json:"usage"`
-	Choices []struct {
+	Model    string `json:"model"`
+	Provider string `json:"provider"`
+	Usage    *usage `json:"usage"`
+	Choices  []struct {
 		Message *struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
@@ -296,6 +348,7 @@ func parseFull(body []byte, r *result) {
 		return
 	}
 	r.model = fr.Model
+	r.provider = fr.Provider
 	r.addUsage(fr.Usage)
 	for _, c := range fr.Choices {
 		if c.Message != nil && len(c.Message.Content) > 0 {

@@ -170,6 +170,75 @@ func TestOpenAIStreamPassthroughAndTiming(t *testing.T) {
 	}
 }
 
+// Reproduces what we saw on OpenRouter free models: a long silence, then the
+// whole generation in one burst. The proxy should flag it and keep the provider.
+func TestBufferedStreamDetection(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		time.Sleep(300 * time.Millisecond)
+		var b strings.Builder
+		for i := 0; i < 15; i++ {
+			fmt.Fprintf(&b, "data: {\"model\":\"dots:free\",\"provider\":\"AtlasCloud\",\"choices\":[{\"delta\":{\"content\":\"t%d \"}}]}\n\n", i)
+		}
+		b.WriteString("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":15}}\n\ndata: [DONE]\n\n")
+		_, _ = w.Write([]byte(b.String())) // one write: everything arrives together
+		w.(http.Flusher).Flush()
+	})
+	srv, exp := setup(t, upstream, false)
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"auto","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	a := attrs(waitSpans(t, exp, 1)[0])
+	if a["llm.stream.buffered"] != true {
+		t.Errorf("burst not detected: chunks=%v median=%v", a["llm.stream.chunks"], a["llm.stream.median_gap_ms"])
+	}
+	if a["langfuse.observation.level"] != "WARNING" {
+		t.Errorf("level = %v", a["langfuse.observation.level"])
+	}
+	if a["gen_ai.provider.name"] != "AtlasCloud" || a["langfuse.observation.metadata.provider"] != "AtlasCloud" {
+		t.Errorf("provider = %v", a["gen_ai.provider.name"])
+	}
+	if a["llm.stream.chunks"] != int64(15) {
+		t.Errorf("chunks = %v", a["llm.stream.chunks"])
+	}
+}
+
+// A genuinely streamed response with steady gaps must not be flagged.
+func TestSteadyStreamNotFlagged(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < 12; i++ {
+			sse(w, fmt.Sprintf(`{"model":"m","choices":[{"delta":{"content":"t%d "}}]}`, i))
+			time.Sleep(10 * time.Millisecond)
+		}
+		sse(w, `[DONE]`)
+	})
+	srv, exp := setup(t, upstream, false)
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	a := attrs(waitSpans(t, exp, 1)[0])
+	if a["llm.stream.buffered"] != false {
+		t.Errorf("steady stream flagged as buffered")
+	}
+	if g, _ := a["llm.stream.median_gap_ms"].(float64); g < 5 {
+		t.Errorf("median gap = %vms, expected ~10ms", g)
+	}
+	if _, ok := a["langfuse.observation.level"]; ok {
+		t.Errorf("unexpected level %v", a["langfuse.observation.level"])
+	}
+}
+
 func TestAnthropicStream(t *testing.T) {
 	var rawBody string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

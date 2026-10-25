@@ -38,6 +38,8 @@ clients (scripts, Claude Code, Codex, agents)
 | Model | the response's `model`, falling back to the request's. With `model: "auto"` you see what actually served it. |
 | Usage | `usage_details` `{input, output, total, input_cache_read?}` |
 | Completion start time | first content/reasoning/tool-call delta, which gives TTFT in the Langfuse UI |
+| Provider | `gen_ai.provider.name` from the response's `provider` field (OpenRouter-style gateways), e.g. `AtlasCloud` |
+| Stream shape | `llm.stream.chunks`, `generation_window_ms`, `max_gap_ms`, `median_gap_ms`, and `stream_buffered`. A stream that spends more than half its time before the first token and then delivers 10+ chunks back to back (median gap under 1 ms) is flagged `WARNING`: upstream buffered the generation and replayed it, so TTFT ≈ total latency. |
 | Filterable metadata | `ttft_ms`, `ttfb_ms`, `output_tokens_per_sec`, `http_status`, `stream`, `endpoint`, `upstream.x-*` headers |
 | Level / status | `ERROR` with the upstream error body on 4xx/5xx/timeouts (429s become visible) |
 | Session / user | `X-Session-Id` / `X-User-Id` headers (or `X-Langfuse-*`), the OpenAI `user` field, Anthropic `metadata.user_id` |

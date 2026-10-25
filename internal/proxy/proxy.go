@@ -313,6 +313,11 @@ func (p *Proxy) finish(rec *record) {
 	if res.model != "" {
 		attrs = append(attrs, otlp.String("gen_ai.response.model", res.model))
 	}
+	if res.provider != "" {
+		attrs = append(attrs,
+			otlp.String("gen_ai.provider.name", res.provider),
+			otlp.String("langfuse.observation.metadata.provider", res.provider))
+	}
 	if p.cfg.Environment != "" {
 		attrs = append(attrs, otlp.String("langfuse.environment", p.cfg.Environment))
 	}
@@ -376,6 +381,27 @@ func (p *Proxy) finish(rec *record) {
 	if len(res.finish) > 0 {
 		attrs = append(attrs, otlp.Strings("gen_ai.response.finish_reasons", res.finish))
 	}
+
+	// Delivery shape: distinguishes real token streaming from a gateway that
+	// buffers the whole generation and replays it as a burst.
+	st := res.stats()
+	buffered := false
+	if rec.stream && st.chunks > 0 {
+		buffered = st.buffered(res.firstToken.Sub(rec.start), dur)
+		attrs = append(attrs,
+			otlp.Int("llm.stream.chunks", int64(st.chunks)),
+			otlp.Float("llm.stream.generation_window_ms", ms(st.genWindow)),
+			otlp.Float("llm.stream.max_gap_ms", ms(st.maxGap)),
+			otlp.Float("llm.stream.median_gap_ms", ms(st.medianGap)),
+			otlp.Bool("llm.stream.buffered", buffered),
+			otlp.Bool("langfuse.observation.metadata.stream_buffered", buffered),
+			otlp.Float("langfuse.observation.metadata.max_gap_ms", ms(st.maxGap)))
+		if buffered && rec.err == nil && rec.status < 400 {
+			attrs = append(attrs,
+				otlp.String("langfuse.observation.level", "WARNING"),
+				otlp.String("langfuse.observation.status_message", "stream appears buffered upstream: tokens arrived in a single burst"))
+		}
+	}
 	if rec.injectedUsage {
 		attrs = append(attrs, otlp.Bool("llm.proxy.injected_include_usage", true))
 	}
@@ -438,6 +464,12 @@ func (p *Proxy) finish(rec *record) {
 		"tokens_in", res.inputTokens,
 		"tokens_out", res.outputTokens,
 		"tps", round(tps),
+		"provider", res.provider,
+		"chunks", st.chunks,
+		"gen_window_ms", round(ms(st.genWindow)),
+		"max_gap_ms", round(ms(st.maxGap)),
+		"median_gap_ms", round(ms(st.medianGap)),
+		"buffered", buffered,
 		"error", msg,
 	)
 }
